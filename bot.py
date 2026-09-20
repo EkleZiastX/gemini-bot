@@ -1,342 +1,262 @@
-import datetime
 import html
 import json
 import os
-import re
 import sqlite3
+import tempfile
 import threading
-
-import telebot
-from telebot import types
+import time
+from fpdf import FPDF
 import google.generativeai as genai
+import telebot
+import yt_dlp
 
-CONFIG_PATH = "/app/config.json" if os.path.exists("/app/config.json") else "config.json"
-DB_PATH = "/app/bot.db" if os.path.exists("/app") else "bot.db"
-
+# ---------------------------------------------------------------------------
+# Загрузка конфигурации
+# ---------------------------------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = json.load(f)
 
+TELEGRAM_BOT_TOKEN = config["TELEGRAM_BOT_TOKEN"]
 SYSTEM_PROMPT = config.get("SYSTEM_PROMPT", "")
-MODELS = config["MODELS"]  # {key: {provider, api_name, api_key, display_name, daily_limit}}
-DEFAULT_MODEL = config.get("DEFAULT_MODEL", next(iter(MODELS)))
-ALLOWED_USERS = config["ALLOWED_USERS"]  # {uid: {"name": ...}}
-ADMIN_IDS = set(str(x) for x in config.get("ADMIN_IDS", []))
+DEFAULT_MODEL = config.get("DEFAULT_MODEL", "flash")
+MODELS = config.get("MODELS", {})
+ADMIN_IDS = [str(i) for i in config.get("ADMIN_IDS", [])]
+ALLOWED_USERS = {str(k): v for k, v in config.get("ALLOWED_USERS", {}).items()}
 
-bot = telebot.TeleBot(config["TELEGRAM_BOT_TOKEN"])
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# Настройка подключения к локальному Telegram Bot API серверу (до 2 ГБ)
+local_api_url = os.getenv("TELEGRAM_API_URL")
+if local_api_url:
+    telebot.apihelper.API_URL = f"{local_api_url}/bot{{0}}/{{1}}"
+    telebot.apihelper.FILE_URL = f"{local_api_url}/file/bot{{0}}/{{1}}"
 
 # ---------------------------------------------------------------------------
-# База данных (SQLite вместо ручной работы с json + save_config())
+# Работа с БД (SQLite)
 # ---------------------------------------------------------------------------
-
-_db_lock = threading.Lock()
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "bot.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 def init_db():
-    with _db_lock, get_db() as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
-                name TEXT,
-                current_model TEXT
+                selected_model TEXT
             )
-            """
+        """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS usage (
-                user_id TEXT,
-                model_key TEXT,
-                date TEXT,
-                requests INTEGER DEFAULT 0,
-                tokens INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, model_key, date)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS totals (
-                user_id TEXT PRIMARY KEY,
-                total_tokens INTEGER DEFAULT 0
-            )
-            """
-        )
+        conn.commit()
 
 
 init_db()
 
 
-def today_str():
-    return datetime.date.today().isoformat()
+def is_allowed(user_id: str) -> bool:
+    return user_id in ALLOWED_USERS or user_id in ADMIN_IDS
 
 
-def ensure_user(uid):
-    name = ALLOWED_USERS[uid].get("name", uid)
-    with _db_lock, get_db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO users (user_id, name, current_model) VALUES (?, ?, ?)",
-                (uid, name, DEFAULT_MODEL),
+def ensure_user(user_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT selected_model FROM users WHERE user_id = ?", (user_id,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO users (user_id, selected_model) VALUES (?, ?)",
+                (user_id, DEFAULT_MODEL),
             )
-            conn.execute(
-                "INSERT OR IGNORE INTO totals (user_id, total_tokens) VALUES (?, 0)", (uid,)
-            )
-        else:
-            conn.execute("UPDATE users SET name=? WHERE user_id=?", (name, uid))
+            conn.commit()
 
 
-def get_current_model(uid):
-    with _db_lock, get_db() as conn:
-        row = conn.execute(
-            "SELECT current_model FROM users WHERE user_id=?", (uid,)
-        ).fetchone()
-        if row and row["current_model"] in MODELS:
-            return row["current_model"]
+def get_current_model(user_id: str) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT selected_model FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0] in MODELS:
+            return row[0]
         return DEFAULT_MODEL
 
 
-def set_current_model(uid, model_key):
-    with _db_lock, get_db() as conn:
-        conn.execute("UPDATE users SET current_model=? WHERE user_id=?", (model_key, uid))
+# ---------------------------------------------------------------------------
+# Генерация PDF с поддержкой кириллицы
+# ---------------------------------------------------------------------------
+def create_pdf_from_text(text: str, output_path: str):
+    pdf = FPDF()
+    pdf.add_page()
 
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    if os.path.exists(font_path):
+        pdf.add_font("DejaVu", "", font_path)
+        pdf.set_font("DejaVu", size=10)
+    else:
+        pdf.set_font("Helvetica", size=10)
+        text = text.encode("latin-1", "replace").decode("latin-1")
 
-def get_usage(uid, model_key):
-    with _db_lock, get_db() as conn:
-        row = conn.execute(
-            "SELECT requests, tokens FROM usage WHERE user_id=? AND model_key=? AND date=?",
-            (uid, model_key, today_str()),
-        ).fetchone()
-        return (row["requests"], row["tokens"]) if row else (0, 0)
-
-
-def add_usage(uid, model_key, tokens):
-    with _db_lock, get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO usage (user_id, model_key, date, requests, tokens)
-            VALUES (?, ?, ?, 1, ?)
-            ON CONFLICT(user_id, model_key, date)
-            DO UPDATE SET requests = requests + 1, tokens = tokens + excluded.tokens
-            """,
-            (uid, model_key, today_str(), tokens),
-        )
-        conn.execute(
-            """
-            INSERT INTO totals (user_id, total_tokens) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET total_tokens = total_tokens + ?
-            """,
-            (uid, tokens, tokens),
-        )
-
-
-def get_total_tokens(uid):
-    with _db_lock, get_db() as conn:
-        row = conn.execute("SELECT total_tokens FROM totals WHERE user_id=?", (uid,)).fetchone()
-        return row["total_tokens"] if row else 0
+    pdf.multi_cell(0, 6, text)
+    pdf.output(output_path)
 
 
 # ---------------------------------------------------------------------------
-# Модели (Gemini сейчас, легко добавить ещё провайдеров позже)
+# Обработка тяжелых медиафайлов и ссылок
 # ---------------------------------------------------------------------------
-
-def get_gemini_model(model_key):
+def process_media_worker(chat_id, source_type, payload, file_name, model_key):
+    status_msg = bot.send_message(chat_id, "Начинаю обработку медиа...")
     cfg = MODELS[model_key]
-    genai.configure(api_key=cfg["api_key"])
-    return genai.GenerativeModel(cfg["api_name"], system_instruction=SYSTEM_PROMPT or None)
 
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_file_path = os.path.join(temp_dir, file_name)
+        audio_path = os.path.join(temp_dir, "media.mp3")
+        pdf_path = os.path.join(temp_dir, "summary.pdf")
 
-chat_sessions = {}  # (uid, model_key) -> chat session
+        try:
+            if source_type == "telegram_file":
+                bot.edit_message_text("Скачиваю файл из Telegram...", chat_id, status_msg.message_id)
+                file_info = bot.get_file(payload)
+                downloaded_file = bot.download_file(file_info.file_path)
 
+                with open(input_file_path, "wb") as new_file:
+                    new_file.write(downloaded_file)
 
-def get_chat_session(uid, model_key):
-    key = (uid, model_key)
-    if key not in chat_sessions:
-        cfg = MODELS[model_key]
-        provider = cfg.get("provider", "gemini")
-        if provider != "gemini":
-            # Место для будущих провайдеров (openai-совместимые и т.д.)
-            raise NotImplementedError(f"Провайдер '{provider}' пока не подключен")
-        model = get_gemini_model(model_key)
-        chat_sessions[key] = model.start_chat(history=[])
-    return chat_sessions[key]
+                bot.edit_message_text("Извлекаю аудио через FFmpeg...", chat_id, status_msg.message_id)
+                os.system(f'ffmpeg -y -i "{input_file_path}" -vn -ar 44100 -ac 2 -b:a 192k "{audio_path}"')
 
+            elif source_type == "url":
+                bot.edit_message_text("Скачиваю по ссылке через yt-dlp...", chat_id, status_msg.message_id)
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": os.path.join(temp_dir, "downloaded.%(ext)s"),
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                    "quiet": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([payload])
 
-def clear_chat_session(uid, model_key):
-    chat_sessions.pop((uid, model_key), None)
+                for f in os.listdir(temp_dir):
+                    if f.endswith(".mp3"):
+                        audio_path = os.path.join(temp_dir, f)
+                        break
 
+            bot.edit_message_text("Загружаю в Gemini Files API...", chat_id, status_msg.message_id)
+            genai.configure(api_key=cfg["api_key"])
+            audio_file = genai.upload_file(path=audio_path)
 
-# ---------------------------------------------------------------------------
-# Markdown (в стиле Gemini) -> Telegram HTML, чтобы шрифты/жирный/код работали
-# ---------------------------------------------------------------------------
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
 
-def gemini_to_telegram_html(text: str) -> str:
-    text = html.escape(text, quote=False)
-    # ```код``` -> <pre>
-    text = re.sub(r"```(?:\w*\n)?(.*?)```", lambda m: f"<pre>{m.group(1)}</pre>", text, flags=re.DOTALL)
-    # `код` -> <code>
-    text = re.sub(r"`([^`\n]+?)`", r"<code>\1</code>", text)
-    # **жирный** -> <b>
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    # *курсив* / _курсив_ -> <i>
-    text = re.sub(r"(?<!\*)\*(?!\*)([^\*\n]+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!_)_(?!_)([^_\n]+?)(?<!_)_(?!_)", r"<i>\1</i>", text)
-    return text
-
-
-TELEGRAM_LIMIT = 4096
-
-
-def send_long_message(chat_id, text, edit_message_id=None):
-    chunks = [text[i:i + TELEGRAM_LIMIT] for i in range(0, len(text), TELEGRAM_LIMIT)] or [""]
-    if edit_message_id:
-        bot.edit_message_text(chunks[0], chat_id, edit_message_id, parse_mode="HTML")
-        chunks = chunks[1:]
-    for chunk in chunks:
-        bot.send_message(chat_id, chunk, parse_mode="HTML")
-
-
-# ---------------------------------------------------------------------------
-# Доступ
-# ---------------------------------------------------------------------------
-
-def is_allowed(uid):
-    return uid in ALLOWED_USERS
-
-
-# ---------------------------------------------------------------------------
-# Хендлеры
-# ---------------------------------------------------------------------------
-
-@bot.message_handler(commands=["start", "stats"])
-def send_stats(message):
-    uid = str(message.from_user.id)
-    if not is_allowed(uid):
-        return
-    ensure_user(uid)
-    model_key = get_current_model(uid)
-    requests_today, tokens_today = get_usage(uid, model_key)
-    limit = MODELS[model_key]["daily_limit"]
-    total_tokens = get_total_tokens(uid)
-
-    text = (
-        f"📊 <b>Статистика {html.escape(ALLOWED_USERS[uid].get('name', uid))}</b>\n"
-        f"🧠 Модель: {html.escape(MODELS[model_key]['display_name'])}\n"
-        f"⚡ Запросов сегодня: {requests_today}/{limit}\n"
-        f"🪙 Токенов сегодня: {tokens_today}\n"
-        f"🪙 Всего токенов: {total_tokens}\n\n"
-        f"Сменить модель: /model"
-    )
-    bot.reply_to(message, text, parse_mode="HTML")
-
-
-@bot.message_handler(commands=["clear"])
-def clear_history(message):
-    uid = str(message.from_user.id)
-    if not is_allowed(uid):
-        return
-    ensure_user(uid)
-    model_key = get_current_model(uid)
-    clear_chat_session(uid, model_key)
-    bot.reply_to(message, "🧹 История нашего диалога очищена! Начнем с чистого листа.")
-
-
-@bot.message_handler(commands=["model"])
-def choose_model(message):
-    uid = str(message.from_user.id)
-    if not is_allowed(uid):
-        return
-    ensure_user(uid)
-    current = get_current_model(uid)
-    kb = types.InlineKeyboardMarkup()
-    for key, cfg in MODELS.items():
-        mark = "✅ " if key == current else ""
-        kb.add(
-            types.InlineKeyboardButton(
-                f"{mark}{cfg['display_name']} ({cfg['daily_limit']}/день)",
-                callback_data=f"setmodel:{key}",
+            bot.edit_message_text("Расшифровываю речь и делаю конспект...", chat_id, status_msg.message_id)
+            model = genai.GenerativeModel(cfg["api_name"], system_instruction=SYSTEM_PROMPT or None)
+            prompt = (
+                "Сделай подробную расшифровку этого аудиоматериала и составь структурированный конспект. "
+                "Выдели основные тезисы, ключевые мысли и добавь таймкоды."
             )
-        )
-    bot.reply_to(message, "Выбери модель:", reply_markup=kb)
+            response = model.generate_content([audio_file, prompt])
+
+            try:
+                genai.delete_file(audio_file.name)
+            except Exception:
+                pass
+
+            bot.edit_message_text("Формирую PDF...", chat_id, status_msg.message_id)
+            create_pdf_from_text(response.text, pdf_path)
+
+            with open(pdf_path, "rb") as doc:
+                bot.send_document(chat_id, doc, caption="Твой конспект и расшифровка готовы!")
+
+            bot.delete_message(chat_id, status_msg.message_id)
+
+        except Exception as e:
+            bot.edit_message_text(
+                f"❌ Ошибка при обработке: {html.escape(str(e)[:200])}",
+                chat_id,
+                status_msg.message_id,
+                parse_mode="HTML",
+            )
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("setmodel:"))
-def on_model_selected(call):
-    uid = str(call.from_user.id)
+# ---------------------------------------------------------------------------
+# Хэндлеры бота
+# ---------------------------------------------------------------------------
+@bot.message_handler(commands=["start"])
+def handle_start(message):
+    uid = str(message.from_user.id)
     if not is_allowed(uid):
         return
-    model_key = call.data.split(":", 1)[1]
-    if model_key not in MODELS:
-        bot.answer_callback_query(call.id, "Такой модели нет 🤔")
+    ensure_user(uid)
+    bot.send_message(message.chat.id, "Привет! Я Юки. Присылай мне текстовые сообщения, ссылки на видео или медиафайлы")
+
+
+@bot.message_handler(regexp=r"(https?://[^\s]+)")
+def handle_link(message):
+    uid = str(message.from_user.id)
+    if not is_allowed(uid):
         return
-    set_current_model(uid, model_key)
-    bot.answer_callback_query(call.id, f"Модель переключена: {MODELS[model_key]['display_name']}")
-    bot.edit_message_text(
-        f"🧠 Теперь ты общаешься с: <b>{html.escape(MODELS[model_key]['display_name'])}</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-    )
+    ensure_user(uid)
+    model_key = get_current_model(uid)
+
+    threading.Thread(
+        target=process_media_worker,
+        args=(message.chat.id, "url", message.text.strip(), "media.mp4", model_key),
+    ).start()
+
+
+@bot.message_handler(content_types=["document", "video", "audio", "voice"])
+def handle_media_files(message):
+    uid = str(message.from_user.id)
+    if not is_allowed(uid):
+        return
+    ensure_user(uid)
+    model_key = get_current_model(uid)
+
+    file_id, file_name = None, "file.tmp"
+    if message.document:
+        file_id = message.document.file_id
+        file_name = message.document.file_name or "file.tmp"
+    elif message.video:
+        file_id = message.video.file_id
+        file_name = "video.mp4"
+    elif message.audio:
+        file_id = message.audio.file_id
+        file_name = message.audio.file_name or "audio.mp3"
+    elif message.voice:
+        file_id = message.voice.file_id
+        file_name = "voice.ogg"
+
+    if file_id:
+        threading.Thread(
+            target=process_media_worker,
+            args=(message.chat.id, "telegram_file", file_id, file_name, model_key),
+        ).start()
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
-def handle_chat(message):
+def handle_text(message):
     uid = str(message.from_user.id)
     if not is_allowed(uid):
         return
-
     ensure_user(uid)
     model_key = get_current_model(uid)
-    requests_today, _ = get_usage(uid, model_key)
-    limit = MODELS[model_key]["daily_limit"]
-
-    if requests_today >= limit:
-        bot.reply_to(
-            message,
-            "⚠️ Лимит запросов для этой модели на сегодня исчерпан..\n"
-            "Можешь попробовать другую модель: /model",
-        )
-        return
-
-    msg = bot.reply_to(message, "🤖 Думаю...")
+    cfg = MODELS[model_key]
 
     try:
-        session = get_chat_session(uid, model_key)
-        response = session.send_message(message.text)
-
-        tokens_count = 0
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            tokens_count = response.usage_metadata.total_token_count
-
-        add_usage(uid, model_key, tokens_count)
-        new_requests_today, _ = get_usage(uid, model_key)
-
-        footer = (
-            f"\n\n<i>[Запрос #{new_requests_today} | Токенов: {tokens_count} | "
-            f"{html.escape(MODELS[model_key]['display_name'])}]</i>"
-        )
-        final_text = gemini_to_telegram_html(response.text) + footer
-
-        send_long_message(message.chat.id, final_text, edit_message_id=msg.message_id)
-
+        genai.configure(api_key=cfg["api_key"])
+        model = genai.GenerativeModel(cfg["api_name"], system_instruction=SYSTEM_PROMPT or None)
+        response = model.generate_content(message.text)
+        bot.reply_to(message, response.text)
     except Exception as e:
-        error_str = str(e)
-        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА В ЛОГАХ: {error_str}")
-        clear_chat_session(uid, model_key)
-        bot.edit_message_text(
-            f"❌ Ошибка: {html.escape(error_str[:200])}... Попробуй /clear и так же отправь мне код ошибки",
-            message.chat.id,
-            msg.message_id,
-            parse_mode="HTML",
-        )
+        bot.reply_to(message, f"❌ Ошибка: {str(e)[:200]}")
 
 
 if __name__ == "__main__":
+    print("Бот Юки запущен...")
     bot.infinity_polling()

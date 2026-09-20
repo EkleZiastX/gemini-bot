@@ -1,14 +1,17 @@
 FROM python:3.11-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Ставим зависимости отдельным слоем, чтобы кэшировалось при правках bot.py
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-# Сюда монтируем volume с бд, чтобы статистика не терялась при пересборке
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/temp
 
 CMD ["python", "bot.py"]
