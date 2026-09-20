@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: yuki-bot
+    restart: unless-stopped
+    volumes:
+      # конфиг с токенами/ключами — читаем, но не пишем из контейнера
+      - ./config.json:/app/config.json:ro
+      # база статистики — переживает пересборки/рестарты
+      - ./data:/app/data
